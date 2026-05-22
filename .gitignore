@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Hydra / experiment outputs
+logs/
+outputs/
+multirun/
+
+# macOS
+.DS_Store
