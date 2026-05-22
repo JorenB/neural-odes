@@ -49,7 +49,7 @@ def true_state(times):
 
 
 class ODEFunc(nn.Module):
-    """Maps a state z -> its time derivative dz/dt. Autonomous: ignores t."""
+    """Free vector field: maps a state z -> dz/dt directly. Autonomous."""
 
     def __init__(self, dim=2, hidden=64):
         super().__init__()
@@ -64,6 +64,32 @@ class ODEFunc(nn.Module):
     def forward(self, t, z):
         # odeint calls f(t, z); we ignore t (the dynamics don't depend on it).
         return self.net(z)
+
+
+class HamiltonianODEFunc(nn.Module):
+    """Learn a SCALAR energy H(q, p); derive the field from Hamilton's eqns:
+        dq/dt =  dH/dp ,   dp/dt = -dH/dq   (the symplectic gradient J . grad H).
+    This conserves H exactly along trajectories -> closed orbits, no energy
+    drift. The state is z = [q, p] (position, momentum)."""
+
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.H = nn.Sequential(
+            nn.Linear(2, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),     # scalar energy
+        )
+
+    def forward(self, t, z):
+        # Need dH/dz even inside no_grad eval contexts -> force grad locally.
+        with torch.enable_grad():
+            z = z.requires_grad_(True)
+            H = self.H(z).sum()                       # sum over batch (H is per-sample)
+            dH = torch.autograd.grad(H, z, create_graph=True)[0]
+        dHdq, dHdp = dH[..., 0:1], dH[..., 1:2]
+        return torch.cat([dHdp, -dHdq], dim=-1)       # [dq/dt, dp/dt]
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -85,7 +111,14 @@ def main(cfg: DictConfig):
     method = cfg.train.solver
 
     # --- 2. Model + optimizer ---------------------------------------------
-    func = ODEFunc(hidden=cfg.model.hidden)
+    if cfg.model.kind == "hnn":
+        func = HamiltonianODEFunc(hidden=cfg.model.hidden)
+    elif cfg.model.kind == "mlp":
+        func = ODEFunc(hidden=cfg.model.hidden)
+    else:
+        raise ValueError(f"unknown model.kind: {cfg.model.kind}")
+    log.info("model: %s (%d params)", cfg.model.kind,
+             sum(p.numel() for p in func.parameters()))
     optimizer = torch.optim.Adam(func.parameters(), lr=cfg.train.lr)
     scheduler = None
     if cfg.train.cosine_decay:
@@ -121,10 +154,10 @@ def main(cfg: DictConfig):
     snapshots = []          # (step, arrows, list-of-rollouts) per snapshot
 
     def take_snapshot(step):
+        arrows = func(0.0, grid).detach()           # HNN forces grad internally
         with torch.no_grad():
-            arrows = func(0.0, grid)
             rolls = [r.clone() for r in rollouts()]
-        snapshots.append((step, arrows.clone(), rolls))
+        snapshots.append((step, arrows, rolls))
 
     # --- 3. Training loop -------------------------------------------------
     # Train on SHORT segments. Because the dynamics are AUTONOMOUS (time-

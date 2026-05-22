@@ -8,7 +8,8 @@ data:
   test_amplitudes: [0.5, 1.0, 1.5, 2.0]   # radii to roll out at eval (some unseen)
 
 model:
-  hidden: 64          # hidden units in the ODE-function MLP
+  kind: hnn           # "hnn" (Hamiltonian: learn energy) or "mlp" (free vector field)
+  hidden: 64          # hidden units in the network
 
 train:
   steps: 2000
