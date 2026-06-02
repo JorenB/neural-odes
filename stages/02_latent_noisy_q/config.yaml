@@ -1,0 +1,29 @@
+seed: 0
+
+data:
+  t_max: 20.0                              # observation horizon (absolute time)
+  dt: 0.1                                  # regular sampling interval
+  k_enc: 8                                 # encoder reads k_enc consecutive q values
+  window_len: 32                           # total training window: k_enc encoder + (window_len-k_enc) prediction
+  n_lut: 4000                              # high-res samples per amp for the true-orbit LUT
+  n_plot: 300                              # eval rollout grid resolution
+  obs_noise: 0.05                          # Stage 2: Gaussian noise on q. q-range ~ [-1.5, 1.5] so 0.05 is small but visible
+  n_eval_seeds: 16                         # average eval MSE over this many noise realizations
+  amplitudes: [0.3, 1.0, 1.5]
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]
+
+model:
+  latent_dim: 2                            # decoder fixed: q = z[0]
+  hidden: 64
+
+train:
+  steps: 2000
+  batch_size: 32
+  lr: 0.005
+  solver: rk4
+  cosine_decay: true
+  log_every: 100
+
+hydra:
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
