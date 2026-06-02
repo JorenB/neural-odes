@@ -289,6 +289,54 @@ def main(cfg: DictConfig):
     p = os.path.join(out_dir, "latent_vs_p.png")
     fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
 
+    # 4d. Post-hoc linear fit z[1] = a*q + b*p ----------------------------
+    # If the encoder learned a single rotated basis, (a, b) is constant
+    # across amplitudes. If it learned an amplitude-specific recipe,
+    # (a, b) varies. R^2 says how well a *linear* fit explains z[1] at all.
+    q_all = truth_TB2[..., 0]                                    # (T, B)
+    p_all = truth_TB2[..., 1]
+    z1_all = z_traj[..., 1]                                      # (T, B)
+
+    def lin_fit(q, p, z1):
+        X = torch.stack([q, p], dim=-1)                          # (..., 2)
+        y = z1.unsqueeze(-1)
+        ab, *_ = torch.linalg.lstsq(X, y)
+        a, b = ab[0, 0].item(), ab[1, 0].item()
+        ss_res = ((y - X @ ab) ** 2).sum().item()
+        ss_tot = ((y - y.mean()) ** 2).sum().item()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        return a, b, r2
+
+    a_g, b_g, r2_g = lin_fit(q_all.flatten(), p_all.flatten(), z1_all.flatten())
+    log.info("global linear fit  z[1] = %+.3f*q  %+.3f*p   R^2 = %.4f",
+             a_g, b_g, r2_g)
+    log.info("per-amplitude linear fits z[1] = a*q + b*p:")
+    per_amp = []
+    for i, A in enumerate(test_amps):
+        a, b, r2 = lin_fit(q_all[:, i], p_all[:, i], z1_all[:, i])
+        per_amp.append((A, a, b, r2))
+        log.info("  A=%-4s  a=%+.3f  b=%+.3f  R^2=%.4f", str(A), a, b, r2)
+
+    # Plot: scatter of actual z[1] vs fitted a*q + b*p, with diagonal.
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, (A, a, b, r2), c) in enumerate(zip(axes[0], per_amp, colors)):
+        actual = z1_all[:, i]
+        fitted = a * q_all[:, i] + b * p_all[:, i]
+        ax.scatter(actual, fitted, color=c, s=8, alpha=0.6)
+        lo = min(actual.min().item(), fitted.min().item())
+        hi = max(actual.max().item(), fitted.max().item())
+        ax.plot([lo, hi], [lo, hi], color="lightgray", lw=1, zorder=0)
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})\na={a:+.2f}  b={b:+.2f}  R²={r2:.3f}",
+                     fontsize=9)
+        ax.set_xlabel("z[1] actual")
+    axes[0][0].set_ylabel("a·q + b·p (fit)")
+    fig.suptitle(f"Linear fit z[1] = a·q + b·p per amplitude    "
+                 f"(global: a={a_g:+.2f}  b={b_g:+.2f}  R²={r2_g:.3f})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "latent_basis_fit.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
 
 if __name__ == "__main__":
     main()
