@@ -1,0 +1,31 @@
+seed: 0
+
+data:
+  t_max: 20.0
+  dt: 0.1                                  # regular sampling interval
+  k_enc: 8                                 # encoder reads k_enc consecutive q values
+  window_len: 32                           # total training window length
+  n_lut: 4000
+  n_plot: 300
+  obs_noise: 0.05                          # Stage 3 starts at Stage 2's noise level for direct comparison
+  n_eval_seeds: 16                         # average eval MSE over this many noise realizations
+  n_posterior_samples: 32                  # samples from q(z|obs) for the fanning-prediction plots
+  amplitudes: [0.3, 1.0, 1.5]
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]
+
+model:
+  latent_dim: 2                            # decoder fixed: q = z[0]
+  hidden: 64
+  beta_kl: 0.01                            # weight of KL term in ELBO (recon + beta * KL)
+
+train:
+  steps: 2000
+  batch_size: 32
+  lr: 0.005
+  solver: rk4
+  cosine_decay: true
+  log_every: 100
+
+hydra:
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
