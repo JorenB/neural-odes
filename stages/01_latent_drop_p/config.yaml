@@ -1,0 +1,28 @@
+seed: 0
+
+data:
+  t_max: 20.0                              # observation horizon (absolute time)
+  dt: 0.1                                  # regular sampling interval (we go irregular again in Stage 4)
+  k_enc: 8                                 # encoder reads k_enc consecutive q values
+  window_len: 32                           # total training window: k_enc encoder + (window_len-k_enc) prediction
+  n_lut: 4000                              # high-res samples per amp for the true-orbit LUT
+  n_plot: 300                              # eval rollout grid resolution
+  obs_noise: 0.0                           # Stage 1: clean observations
+  amplitudes: [0.3, 1.0, 1.5]              # Stage 0's multi-amp winner carried over
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]    # interior A=0.6 is unseen
+
+model:
+  latent_dim: 2                            # matches true state dim; decoder is FIXED as q = z[0]
+  hidden: 64                               # hidden units in both encoder and ODE MLPs
+
+train:
+  steps: 2000
+  batch_size: 32                           # windows per optimization step
+  lr: 0.005                                # two networks to train; slightly conservative
+  solver: rk4
+  cosine_decay: true                       # decay lr to ~0 over training
+  log_every: 100
+
+hydra:
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
