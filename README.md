@@ -28,8 +28,9 @@ Each run writes a timestamped dir under `logs/` (Hydra) containing:
 - `law_evolution.png` — learned vector field over training
 - `.hydra/` (resolved config + overrides) and `train_pendulum.log`
 
-## What we've learned so far (sine-wave branch)
+## What we've learned so far
 
+### Sine-wave branch
 - A sine wave needs a **2D** phase state `[x, v]`; a 1D autonomous ODE can't oscillate.
 - Long-horizon training collapses to the mean → train on **short windows**.
 - **Irregular timestamps** are handled natively and even help (augmentation over `dt`).
@@ -40,3 +41,17 @@ Each run writes a timestamped dir under `logs/` (Hydra) containing:
 - An **HNN** inductive bias (learn scalar H, derive field as J·∇H) hard-enforces energy
   conservation, fixing the outward spiral — but H is only pinned near data, so it doesn't
   rescue outward extrapolation either.
+
+### Pendulum branch
+- Same infra carries over verbatim once `true_state` is replaced by a per-amplitude
+  numerical LUT — the autonomous shared-local-grid batching trick still applies.
+- Trained on a single amplitude A=1.0, the network learns to rotate *everything* at
+  A=1.0's frequency. Unseen amplitudes all oscillate at the wrong period (small ones
+  too fast, large ones too slow vs truth) — hidden in the phase portrait, obvious in
+  `angle_vs_time.png`.
+- Training on three amplitudes `[0.3, 1.0, 1.5]` is enough for the network to internalize
+  the **nonlinear period-vs-amplitude relationship**. The unseen A=0.6 interpolates with
+  rollout MSE ~1e-4 — three orders of magnitude better than the single-amp run.
+- So "interpolation in amplitude works" generalizes from the sine setup: even when the
+  thing being interpolated is a genuinely nonlinear function (period of the pendulum),
+  three well-chosen training points are enough to pin it down across the interval.
