@@ -1,23 +1,24 @@
 seed: 0
 
 data:
-  periods: 3              # number of oscillation periods to observe
-  n_obs: 200              # observations per oscillator (irregularly spaced)
-  obs_noise: 0.0          # std of Gaussian noise on measured (x, v)
-  amplitudes: [1.0]       # one oscillator (circle) per amplitude; try [0.5, 1.0, 1.5]
-  test_amplitudes: [0.5, 1.0, 1.5, 2.0]   # radii to roll out at eval (some unseen)
+  t_max: 20.0             # observation horizon in absolute time units
+  n_obs: 200              # nominal sampling density (mean window-gap = t_max/n_obs)
+  n_lut: 4000             # high-res samples per amplitude for the true-orbit LUT
+  obs_noise: 0.0          # std of Gaussian noise on observed (q, p)
+  amplitudes: [1.0]                          # q_max (rad) per training orbit
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]      # rollout at these q_max values
 
 model:
-  hidden: 64          # hidden units in the ODE-function MLP
+  hidden: 64              # hidden units in the ODE-function MLP
 
 train:
   steps: 2000
-  batch_window: 16    # observations per short training window
-  batch_size: 16      # windows per optimization step
+  batch_window: 16        # observations per short training window
+  batch_size: 16          # windows per optimization step
   lr: 0.01
-  solver: rk4         # odeint method; rk4 (fixed-step) is fast & plenty accurate here
-  cosine_decay: true  # decay lr to ~0 over training to calm late-stage instability
-  log_every: 100      # log train loss + eval rollout MSE every N steps
+  solver: rk4             # odeint method; rk4 (fixed-step) is fast & accurate here
+  cosine_decay: true      # decay lr to ~0 over training to calm late-stage instability
+  log_every: 100          # log train loss + eval rollout MSE every N steps
   snap_steps: [0, 50, 200, 500, 1000, 2000]   # 0 = before training (initialization)
 
 # Each run gets its own timestamped directory under logs/. Figures are saved
