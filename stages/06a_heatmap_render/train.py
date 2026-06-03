@@ -45,7 +45,10 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torchdiffeq import odeint
 
-matplotlib.use("Agg")
+# NOTE: don't pin matplotlib's backend at import time -- otherwise importing
+# this module from a notebook (explore.ipynb) hijacks the notebook's
+# interactive backend and plt.show() stops working. We switch to Agg only
+# when running this file as a script (see the __main__ block at the bottom).
 import matplotlib.pyplot as plt
 
 log = logging.getLogger(__name__)
@@ -510,4 +513,6 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+    # Script mode: render figures to files, no display.
+    matplotlib.use("Agg", force=True)
     main()
