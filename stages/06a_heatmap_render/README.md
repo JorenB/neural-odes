@@ -25,12 +25,33 @@ cd stages/06a_heatmap_render
 uv run python train.py
 ```
 
+Training also saves `model.pt` to the run dir, which is what the
+exploration notebook loads.
+
 Outputs: same six figures as Stage 4, plus a new one:
 
 - `encoder_input_example.png` — visualizes a typical encoder window: per
   amplitude, a 10×64 image showing 10 noisy heatmap observations stacked
   vertically, with red dots marking the true `q` at each observation
   time. Sanity check that the input looks the way we think it should.
+
+## Explore interactively: `explore.ipynb`
+
+A Jupyter notebook that walks end-to-end through one sample, with
+visualisations of every intermediate object: the true `q(t)`, the
+heatmap encoding, the encoder's posterior `(μ, σ)`, the latent rollout,
+the decoded `q_pred(t)`, the predicted heatmap movie, and the actual
+pendulum drawn as a swinging stick. Includes a posterior-fan
+visualization showing 32 sampled pendulum poses overlaid at a few
+moments in time.
+
+```bash
+uv run jupyter notebook explore.ipynb
+```
+
+Loads the most recent `model.pt` by default; cells flagged `# tweak`
+are where you change amplitude / random seed / chosen timestamp /
+sample count to play around.
 
 ## Headline findings
 

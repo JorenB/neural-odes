@@ -315,6 +315,13 @@ def main(cfg: DictConfig):
     func.load_state_dict(best_state[1])
     log.info("restored best model (on-data q-rollout mse = %.3e)", best_err)
 
+    # Save model + config to model.pt for downstream exploration (notebooks etc).
+    torch.save({"encoder_state": encoder.state_dict(),
+                "func_state": func.state_dict(),
+                "config": OmegaConf.to_container(cfg, resolve=True)},
+               os.path.join(out_dir, "model.pt"))
+    log.info("saved checkpoint -> %s", os.path.join(out_dir, "model.pt"))
+
     # --- 4. Figures -------------------------------------------------------
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(test_amps) - 1)) for i in range(len(test_amps))]
