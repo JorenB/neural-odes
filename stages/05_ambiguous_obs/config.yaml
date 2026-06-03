@@ -1,0 +1,32 @@
+seed: 0
+
+data:
+  t_max: 20.0                              # full data horizon
+  window_horizon: 6.0                      # observation/prediction window per training sample (~1 period at A=1.0)
+  n_obs: 10                                # sparse irregular observations per window (encoder input)
+  target_dt: 0.1                           # spacing of the dense regular target grid (for loss)
+  target_T: 60                             # number of target grid points; covers [0, 5.9] s
+  n_lut: 4000
+  n_plot: 300                              # eval rollout grid resolution
+  obs_noise: 0.05                          # Gaussian noise on observed q
+  n_eval_seeds: 16                         # eval MSE averaged over this many noise+obs-time realizations
+  n_posterior_samples: 32                  # samples from q(z|obs) for the fanning-prediction plots
+  amplitudes: [0.3, 1.0, 1.5]
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]
+
+model:
+  latent_dim: 2
+  hidden: 64                               # GRU hidden size & ODE MLP hidden width
+  beta_kl: 0.01
+
+train:
+  steps: 2000
+  batch_size: 32
+  lr: 0.005
+  solver: rk4
+  cosine_decay: true
+  log_every: 100
+
+hydra:
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
