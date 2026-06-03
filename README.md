@@ -59,16 +59,18 @@ uv run python train.py 'data.amplitudes=[0.3,1.0,1.5]'    # CLI overrides
   conservation, fixing the outward spiral — but H is only pinned near data, so it doesn't
   rescue outward extrapolation either.
 
-### Pendulum branch — Stage 0
+### Pendulum branch — executive summary
 
-- Same infra carries over verbatim once `true_state` is replaced by a per-amplitude
-  numerical LUT — the autonomous shared-local-grid batching trick still applies.
-- Trained on a single amplitude A=1.0, the network learns to rotate *everything* at
-  A=1.0's frequency. Unseen amplitudes all oscillate at the wrong period — hidden in the
-  phase portrait, obvious in `angle_vs_time.png`.
-- Training on three amplitudes `[0.3, 1.0, 1.5]` is enough for the network to internalize
-  the nonlinear period-vs-amplitude relationship. The unseen A=0.6 interpolates with
-  rollout MSE ~1e-4 — three orders of magnitude better than the single-amp run.
-- So "interpolation in amplitude works" generalizes from the sine setup: even when the
-  thing being interpolated is a genuinely nonlinear function (period of the pendulum),
-  three well-chosen training points pin it down across the interval.
+See per-stage READMEs under `stages/` for details.
+
+- **Stage 0** — baseline neural ODE on the full-state pendulum. Three trained amplitudes are enough for the model to internalize the nonlinear period-vs-amplitude relationship; interior amplitudes interpolate well.
+- **Stage 1** — drop `p`, infer it from a window of `q` observations via a small MLP encoder. Works at ~3 orders of magnitude worse MSE than Stage 0. `z[1]` is approximately a rotated `p`, not literally `p`.
+- **Stage 2** — add noise to `q`. Encoder absorbs it reasonably well up to σ ≈ 0.1, then degrades. Noise even *helps* the most fragile amplitude at low levels (acts as regularization).
+- **Stage 3** — variational encoder (proper Latent ODE). Surprise: variational training improved *point* predictions ~5× — KL regularization smooths the latent space, not just adds uncertainty quantification. Posterior calibration is "honest but coarse."
+- **Stage 4** — sparse irregular observations with a GRU encoder. Works *better* than Stage 3 — sparse-but-wide observation coverage beats dense-but-narrow. Latent basis fit cleanest yet (R² ≈ 0.99).
+- **Stage 5** — ambiguous observation map (`o = q²`). Clean demonstration that diagonal-Gaussian posteriors can't represent bimodal evidence: mode averaging at low amplitudes, mode collapse at high, flat predictions in both regimes.
+
+**Threads running through the curriculum:**
+- Linear-fit R² of `z[1]` against `(q, p)` improved monotonically across stages — adding regularization (KL) and sequential structure (GRU) both pulled the encoder toward physically natural latent coordinates.
+- Variational machinery does more than uncertainty: KL acts as a structural regularizer that improves point predictions and generalization.
+- Sample-efficient learning of nonlinear dynamics works when (a) the observation map is invertible, (b) the encoder can recover the state's full dimensionality, and (c) the posterior family can express the actual uncertainty. Stage 5 breaks (c); the perception ladder ahead is where (a) and (b) get genuinely difficult.

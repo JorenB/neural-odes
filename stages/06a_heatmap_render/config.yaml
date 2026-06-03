@@ -1,0 +1,36 @@
+seed: 0
+
+data:
+  t_max: 20.0
+  window_horizon: 6.0
+  n_obs: 10
+  target_dt: 0.1
+  target_T: 60
+  n_lut: 4000
+  n_plot: 300
+  obs_noise: 0.05                          # std of per-pixel Gaussian noise on the heatmap observation
+  n_eval_seeds: 16
+  n_posterior_samples: 32
+  amplitudes: [0.3, 1.0, 1.5]
+  test_amplitudes: [0.3, 0.6, 1.0, 1.5]
+  # --- heatmap rendering parameters (NEW for Stage 6a) ---
+  heatmap_n: 64                            # length of the 1D heatmap array (the observation dim)
+  heatmap_range: 2.5                       # heatmap spans [-heatmap_range, +heatmap_range] in q-space
+  heatmap_sigma: 0.15                      # width of the Gaussian bump
+
+model:
+  latent_dim: 2
+  hidden: 64
+  beta_kl: 0.01
+
+train:
+  steps: 2000
+  batch_size: 32
+  lr: 0.005
+  solver: rk4
+  cosine_decay: true
+  log_every: 100
+
+hydra:
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
