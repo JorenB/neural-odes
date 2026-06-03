@@ -1,0 +1,455 @@
+"""
+Stage 4 -- Sparse irregular observations + GRU encoder (proper Latent ODE).
+
+What changes vs Stage 3
+-----------------------
+- INPUT is now sparse and irregular: per training sample, n_obs (=10) random
+  times in [0, window_horizon] (=6 s) instead of a regular 8-point window.
+- ENCODER is a GRU that processes (t_i, q_i) pairs one at a time, in REVERSE
+  chronological order (latest first), so the final hidden state is most
+  sensitive to observations near the anchor time t=0.
+- TARGET is a dense regular grid (60 points at dt=0.1) covering the same
+  window. The model has to predict q at the dense grid from sparse irregular
+  encoder input.
+- z0 is anchored at LOCAL TIME 0 (start of window). The encoder must learn to
+  back-project observations at irregular t > 0 to "what was z at t=0?".
+
+Architecture
+------------
+  Encoder  GRU(input=2, hidden=64) + two heads (mu, logvar in R^2)
+           Input per step: (t_i, q_i), iterated from latest to earliest.
+  Sampling z0 ~ N(mu, sigma^2 I)   via the reparameterization trick.
+  ODE      f_theta : z --> dz/dt   (autonomous MLP, same as before)
+  Decoder  h : z --> q             (FIXED: h(z) = z[0])
+
+Loss = mean((q_pred - q_target)^2)  +  beta * KL(N(mu, sigma^2 I) || N(0, I))
+
+Headline question
+-----------------
+Does swapping the regular-window MLP encoder for a sequence-aware GRU make
+the model gracefully handle irregular sparse data? With n_obs=10 over 6s,
+the average gap is 0.6s -- much sparser than Stage 3's 0.1s spacing -- but
+the coverage is much wider. Net effect on point predictions and posterior
+calibration is open.
+"""
+
+import copy
+import logging
+import os
+
+import hydra
+import matplotlib
+import torch
+import torch.nn as nn
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
+from torchdiffeq import odeint
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+log = logging.getLogger(__name__)
+
+
+def true_pendulum_field(t, z):
+    """Ground-truth vector field: dz/dt = [p, -sin(q)]. Autonomous."""
+    q, p = z[..., 0:1], z[..., 1:2]
+    return torch.cat([p, -torch.sin(q)], dim=-1)
+
+
+class PendulumTruth:
+    """Per-amplitude high-res (q, p) trajectories. Same as Stage 0."""
+
+    _KEY_PRECISION = 5
+
+    @classmethod
+    def _key(cls, A):
+        return round(float(A), cls._KEY_PRECISION)
+
+    def __init__(self, amplitudes, t_max, n_lut, method):
+        self.t_max = float(t_max)
+        self.t_lut = torch.linspace(0.0, self.t_max, n_lut)
+        self.trajs = {}
+        for A in amplitudes:
+            z0 = torch.tensor([float(A), 0.0])
+            with torch.no_grad():
+                traj = odeint(true_pendulum_field, z0, self.t_lut, method=method)
+            self.trajs[self._key(A)] = traj                          # (n_lut, 2)
+
+    def state(self, A_batch, times):
+        """A_batch: (B,) amps. times: (T,) shared or (T, B). Returns (T, B, 2)."""
+        B = A_batch.shape[0]
+        T = times.shape[0]
+        t_TB = times[:, None].expand(T, B) if times.ndim == 1 else times
+        t_clamped = t_TB.clamp(0.0, float(self.t_lut[-1]) - 1e-7)
+        idx = torch.bucketize(t_clamped, self.t_lut) - 1
+        idx = idx.clamp(0, len(self.t_lut) - 2)
+        t0 = self.t_lut[idx]; t1 = self.t_lut[idx + 1]
+        w = ((t_clamped - t0) / (t1 - t0)).unsqueeze(-1)             # (T, B, 1)
+        out = torch.empty(T, B, 2)
+        for b in range(B):
+            traj = self.trajs[self._key(A_batch[b].item())]
+            i = idx[:, b]
+            out[:, b] = torch.lerp(traj[i], traj[i + 1], w[:, b])
+        return out
+
+
+class VariationalEncoderGRU(nn.Module):
+    """GRU-based variational encoder for irregular sparse observations.
+
+    Each observation is fed as a 2-vector (t_i, q_i). The GRU consumes the
+    observations in REVERSE chronological order (latest first, earliest last)
+    so the final hidden state is most influenced by observations near the
+    anchor time t=0. Two heads then project the final hidden state to the
+    posterior parameters (mu, logvar) of q(z0 | observations)."""
+
+    def __init__(self, hidden_size=64, latent_dim=2):
+        super().__init__()
+        # input_size=2: each step sees (t_obs, q_obs)
+        self.gru = nn.GRU(input_size=2, hidden_size=hidden_size, batch_first=True)
+        self.head_mu = nn.Linear(hidden_size, latent_dim)
+        self.head_logvar = nn.Linear(hidden_size, latent_dim)
+
+    def forward(self, times, values):
+        """times: (B, N) sorted ascending. values: (B, N) corresponding q.
+        Returns (mu, logvar), each (B, latent_dim)."""
+        # Flip along the time axis: latest observation first, earliest last.
+        times_rev = times.flip(dims=[1])
+        values_rev = values.flip(dims=[1])
+        x = torch.stack([times_rev, values_rev], dim=-1)             # (B, N, 2)
+        _, h_final = self.gru(x)                                     # (1, B, hidden)
+        h = h_final.squeeze(0)                                       # (B, hidden)
+        return self.head_mu(h), self.head_logvar(h)
+
+    def sample(self, times, values):
+        """Reparameterized sample. Returns (z0, mu, logvar)."""
+        mu, logvar = self.forward(times, values)
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + std * eps, mu, logvar
+
+
+class ODEFunc(nn.Module):
+    """Latent vector field dz/dt = f_theta(z). Autonomous."""
+
+    def __init__(self, dim=2, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, t, z):
+        return self.net(z)
+
+
+def decode_q(z):
+    """Fixed decoder: q = z[0]. No parameters; makes z[0] interpretable as angle."""
+    return z[..., 0]
+
+
+@hydra.main(version_base=None, config_path=".", config_name="config")
+def main(cfg: DictConfig):
+    out_dir = HydraConfig.get().runtime.output_dir
+    log.info("config:\n%s", OmegaConf.to_yaml(cfg))
+    log.info("output dir: %s", out_dir)
+    torch.manual_seed(cfg.seed)
+
+    # --- 1. Data ----------------------------------------------------------
+    t_max = float(cfg.data.t_max)
+    train_amps = list(cfg.data.amplitudes)
+    test_amps = list(cfg.data.test_amplitudes)
+    all_amps = sorted(set(train_amps) | set(test_amps))
+    train_amps_t = torch.tensor(train_amps)
+    test_amps_t = torch.tensor(test_amps)
+    method = cfg.train.solver
+    truth = PendulumTruth(all_amps, t_max, cfg.data.n_lut, method)
+
+    horizon = float(cfg.data.window_horizon)
+    n_obs = int(cfg.data.n_obs)
+    T = int(cfg.data.target_T)
+    target_dt = float(cfg.data.target_dt)
+    local_t = torch.arange(T, dtype=torch.float32) * target_dt       # (T,) dense regular target grid
+
+    # --- 2. Model + optimizer ---------------------------------------------
+    encoder = VariationalEncoderGRU(hidden_size=cfg.model.hidden,
+                                    latent_dim=cfg.model.latent_dim)
+    beta_kl = float(cfg.model.beta_kl)
+    func = ODEFunc(dim=cfg.model.latent_dim, hidden=cfg.model.hidden)
+    params = list(encoder.parameters()) + list(func.parameters())
+    optimizer = torch.optim.Adam(params, lr=cfg.train.lr)
+    scheduler = None
+    if cfg.train.cosine_decay:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.train.steps, eta_min=cfg.train.lr * 0.01)
+
+    # phase0 must leave a full horizon-wide window inside the LUT range.
+    phase_max = max(0.0, t_max - horizon)
+    B = cfg.train.batch_size
+
+    def sample_obs_window_at(A_t, phase0):
+        """Sample (B, n_obs) random local observation times in [0, horizon],
+        return them sorted ascending along with the corresponding noisy q
+        values. phase0 (B,) is the absolute time at which the window's
+        local-time 0 starts -- random during training, ZERO at eval (so the
+        encoder sees the trajectory from its own initial condition)."""
+        Bn = len(A_t)
+        obs_local = torch.rand(Bn, n_obs) * horizon                   # (B, N)
+        obs_local, _ = obs_local.sort(dim=1)                          # ascending in time
+        obs_abs = phase0[:, None] + obs_local                         # (B, N)
+        q_obs = truth.state(A_t, obs_abs.T)[..., 0].T                 # (B, N)
+        q_obs = q_obs + cfg.data.obs_noise * torch.randn_like(q_obs)
+        return obs_local, q_obs
+
+    def sample_batch():
+        """Per-step batch: random amplitudes, random phases, random irregular
+        observation windows, AND a shared dense target grid for the loss."""
+        A_idx = torch.randint(0, len(train_amps_t), (B,))
+        A = train_amps_t[A_idx]                                       # (B,)
+        phase0 = torch.rand(B) * phase_max                            # (B,)
+        obs_local, q_obs = sample_obs_window_at(A, phase0)            # (B, N), (B, N)
+        target_abs = phase0[None, :] + local_t[:, None]               # (T, B)
+        q_target = truth.state(A, target_abs)[..., 0]                 # (T, B)
+        q_target = q_target + cfg.data.obs_noise * torch.randn_like(q_target)
+        return obs_local, q_obs, q_target
+
+    def rollout_from(A_t, t_grid, sample=False):
+        """Eval helper: encoder sees a random irregular window of THIS amplitude's
+        trajectory starting from its initial condition (phase0=0). Integrates
+        from z0 (either mu or one posterior sample) over t_grid."""
+        Bn = len(A_t)
+        phase0 = torch.zeros(Bn)                                      # eval anchored at trajectory start
+        obs_local, q_obs = sample_obs_window_at(A_t, phase0)
+        mu, logvar = encoder(obs_local, q_obs)
+        if sample:
+            z0 = mu + (0.5 * logvar).exp() * torch.randn_like(mu)
+        else:
+            z0 = mu
+        z = odeint(func, z0, t_grid, method=method)
+        return decode_q(z), z
+
+    def posterior_samples(A_t, t_grid, n_samples):
+        """One noisy encoder window per amplitude (phase0=0), then n_samples
+        reparam draws from that posterior."""
+        Bn = len(A_t)
+        phase0 = torch.zeros(Bn)
+        obs_local, q_obs = sample_obs_window_at(A_t, phase0)
+        mu, logvar = encoder(obs_local, q_obs)
+        std = (0.5 * logvar).exp()
+        samples = []
+        for _ in range(n_samples):
+            z0 = mu + std * torch.randn_like(mu)
+            z = odeint(func, z0, t_grid, method=method)
+            samples.append(decode_q(z))
+        return torch.stack(samples, dim=0)
+
+    @torch.no_grad()
+    def eval_rollout_mse():
+        # Average over multiple draws of (noise + observation-time pattern).
+        t_plot = torch.linspace(0.0, horizon, cfg.data.n_plot)
+        truth_TB = truth.state(test_amps_t, t_plot)[..., 0]
+        n_seeds = int(cfg.data.n_eval_seeds)
+        acc = torch.zeros(len(test_amps))
+        for _ in range(n_seeds):
+            q_pred, _ = rollout_from(test_amps_t, t_plot, sample=False)
+            acc += ((q_pred - truth_TB) ** 2).mean(dim=0)
+        acc /= n_seeds
+        return {A: acc[i].item() for i, A in enumerate(test_amps)}
+
+    # --- 3. Training loop -------------------------------------------------
+    best_err = float("inf")
+    best_state = (copy.deepcopy(encoder.state_dict()),
+                  copy.deepcopy(func.state_dict()))
+    for step in range(1, cfg.train.steps + 1):
+        optimizer.zero_grad()
+        obs_local, q_obs, q_target = sample_batch()                  # (B, N), (B, N), (T, B)
+        z0, mu, logvar = encoder.sample(obs_local, q_obs)            # (B, latent) each
+        z = odeint(func, z0, local_t, method=method)                 # (T, B, latent)
+        q_pred = decode_q(z)                                         # (T, B)
+        recon = torch.mean((q_pred - q_target) ** 2)
+        # KL(N(mu, sigma^2 I) || N(0, I)) summed over latent dim, mean over batch.
+        kl = 0.5 * (logvar.exp() + mu.pow(2) - 1.0 - logvar).sum(dim=-1).mean()
+        loss = recon + beta_kl * kl
+        loss.backward()
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        if step % cfg.train.log_every == 0 or step == 1:
+            errs = eval_rollout_mse()
+            seen_err = sum(errs[A] for A in train_amps) / len(train_amps)
+            if seen_err < best_err:
+                best_err = seen_err
+                best_state = (copy.deepcopy(encoder.state_dict()),
+                              copy.deepcopy(func.state_dict()))
+            err_str = "  ".join(f"A={A}:{errs[A]:.2e}" for A in test_amps)
+            log.info("step %4d  lr %.4f  recon %.3e  kl %.3e  q_rollout_mse[ %s ]  best %.3e",
+                     step, optimizer.param_groups[0]["lr"],
+                     recon.item(), kl.item(), err_str, best_err)
+
+    encoder.load_state_dict(best_state[0])
+    func.load_state_dict(best_state[1])
+    log.info("restored best model (on-data q-rollout mse = %.3e)", best_err)
+
+    # --- 4. Figures -------------------------------------------------------
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(i / max(1, len(test_amps) - 1)) for i in range(len(test_amps))]
+    t_plot = torch.linspace(0.0, horizon, cfg.data.n_plot)
+    with torch.no_grad():
+        q_pred, z_traj = rollout_from(test_amps_t, t_plot)           # (T, B), (T, B, latent)
+        truth_TB2 = truth.state(test_amps_t, t_plot)                 # (T, B, 2)
+
+    nt = len(test_amps)
+
+    # 4a. q vs t per amplitude (Stage 0 analog -- the headline reconstruction)
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, A, c) in enumerate(zip(axes[0], test_amps, colors)):
+        true_q = truth_TB2[:, i, 0]
+        ax.plot(t_plot, true_q, color="lightgray", lw=3, label="true q(t)")
+        ax.plot(t_plot, q_pred[:, i], "--", color=c, lw=1.4, label="latent ODE")
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})")
+        ax.set_xlabel("t")
+    axes[0][0].set_ylabel("q"); axes[0][0].legend(fontsize=7, loc="upper right")
+    fig.suptitle(f"Predicted q(t) from drop-p latent ODE  (GRU encoder, N={n_obs} irregular obs over {horizon} s, σ={cfg.data.obs_noise}, β={beta_kl})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "q_vs_time.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+    # 4b. Latent phase portrait with true (q, p) overlay
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.6), squeeze=False)
+    for i, (ax, A, c) in enumerate(zip(axes[0], test_amps, colors)):
+        true_qp = truth_TB2[:, i]
+        ax.plot(true_qp[:, 0], true_qp[:, 1], color="lightgray", lw=3,
+                label="true (q, p)")
+        z_i = z_traj[:, i]
+        ax.plot(z_i[:, 0], z_i[:, 1], "--", color=c, lw=1.4,
+                label="latent (z[0], z[1])")
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})")
+        ax.set_xlabel("z[0]  (= predicted q)")
+    axes[0][0].set_ylabel("z[1]  (hidden)")
+    axes[0][0].legend(fontsize=7, loc="upper right")
+    fig.suptitle(f"Latent phase portrait vs true (q, p)  (GRU encoder, N={n_obs} irregular obs over {horizon} s, σ={cfg.data.obs_noise}, β={beta_kl})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "latent_orbits.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+    # 4c. Scatter z[1] vs true p -- the cleanest "did it learn momentum?" test
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, A, c) in enumerate(zip(axes[0], test_amps, colors)):
+        true_p = truth_TB2[:, i, 1]
+        z1 = z_traj[:, i, 1]
+        ax.scatter(true_p, z1, color=c, s=8, alpha=0.6)
+        ax.axhline(0, color="lightgray", lw=0.5)
+        ax.axvline(0, color="lightgray", lw=0.5)
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})")
+        ax.set_xlabel("true p")
+    axes[0][0].set_ylabel("z[1]")
+    fig.suptitle(f"z[1] vs true p  (GRU encoder, N={n_obs} irregular obs over {horizon} s, σ={cfg.data.obs_noise}, β={beta_kl})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "latent_vs_p.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+    # 4d. Post-hoc linear fit z[1] = a*q + b*p ----------------------------
+    # If the encoder learned a single rotated basis, (a, b) is constant
+    # across amplitudes. If it learned an amplitude-specific recipe,
+    # (a, b) varies. R^2 says how well a *linear* fit explains z[1] at all.
+    q_all = truth_TB2[..., 0]                                    # (T, B)
+    p_all = truth_TB2[..., 1]
+    z1_all = z_traj[..., 1]                                      # (T, B)
+
+    def lin_fit(q, p, z1):
+        X = torch.stack([q, p], dim=-1)                          # (..., 2)
+        y = z1.unsqueeze(-1)
+        ab, *_ = torch.linalg.lstsq(X, y)
+        a, b = ab[0, 0].item(), ab[1, 0].item()
+        ss_res = ((y - X @ ab) ** 2).sum().item()
+        ss_tot = ((y - y.mean()) ** 2).sum().item()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        return a, b, r2
+
+    a_g, b_g, r2_g = lin_fit(q_all.flatten(), p_all.flatten(), z1_all.flatten())
+    log.info("global linear fit  z[1] = %+.3f*q  %+.3f*p   R^2 = %.4f",
+             a_g, b_g, r2_g)
+    log.info("per-amplitude linear fits z[1] = a*q + b*p:")
+    per_amp = []
+    for i, A in enumerate(test_amps):
+        a, b, r2 = lin_fit(q_all[:, i], p_all[:, i], z1_all[:, i])
+        per_amp.append((A, a, b, r2))
+        log.info("  A=%-4s  a=%+.3f  b=%+.3f  R^2=%.4f", str(A), a, b, r2)
+
+    # Plot: scatter of actual z[1] vs fitted a*q + b*p, with diagonal.
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, (A, a, b, r2), c) in enumerate(zip(axes[0], per_amp, colors)):
+        actual = z1_all[:, i]
+        fitted = a * q_all[:, i] + b * p_all[:, i]
+        ax.scatter(actual, fitted, color=c, s=8, alpha=0.6)
+        lo = min(actual.min().item(), fitted.min().item())
+        hi = max(actual.max().item(), fitted.max().item())
+        ax.plot([lo, hi], [lo, hi], color="lightgray", lw=1, zorder=0)
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})\na={a:+.2f}  b={b:+.2f}  R²={r2:.3f}",
+                     fontsize=9)
+        ax.set_xlabel("z[1] actual")
+    axes[0][0].set_ylabel("a·q + b·p (fit)")
+    fig.suptitle(f"Linear fit z[1] = a·q + b·p per amplitude    "
+                 f"(global: a={a_g:+.2f}  b={b_g:+.2f}  R²={r2_g:.3f})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "latent_basis_fit.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+    # 4e. Posterior samples: predictive fan from q(z0|obs) ----------------
+    # For each test amp, draw n_posterior_samples z0 from the posterior and
+    # integrate. Faint lines = individual samples; solid = sample mean.
+    # Tells us: is the posterior wide enough to cover truth? Or collapsed?
+    n_samp = int(cfg.data.n_posterior_samples)
+    with torch.no_grad():
+        q_samples = posterior_samples(test_amps_t, t_plot, n_samp)   # (S, T, B)
+    q_samples_np = q_samples.numpy()
+    q_mean = q_samples.mean(dim=0)                                   # (T, B)
+    q_std = q_samples.std(dim=0)                                     # (T, B)
+
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, A, c) in enumerate(zip(axes[0], test_amps, colors)):
+        true_q = truth_TB2[:, i, 0]
+        ax.plot(t_plot, true_q, color="lightgray", lw=3, label="true q(t)")
+        for s in range(n_samp):
+            ax.plot(t_plot, q_samples_np[s, :, i], color=c, lw=0.4, alpha=0.25)
+        ax.plot(t_plot, q_mean[:, i], color=c, lw=1.6, label="sample mean")
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})")
+        ax.set_xlabel("t")
+    axes[0][0].set_ylabel("q"); axes[0][0].legend(fontsize=7, loc="upper right")
+    fig.suptitle(f"Posterior predictive samples  "
+                 f"({n_samp} draws, σ={cfg.data.obs_noise}, β={beta_kl})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "posterior_samples.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+    # 4f. Calibration: predicted std vs actual residual --------------------
+    # If the posterior is well-calibrated, the empirical std of sampled q(t)
+    # should be of the same order as |sample mean - truth|. If predicted std
+    # << residual, posterior is overconfident; if >> residual, underconfident.
+    residual = (q_mean - truth_TB2[..., 0]).abs()                    # (T, B)
+    fig, axes = plt.subplots(1, nt, figsize=(3.6 * nt, 3.0), squeeze=False)
+    for i, (ax, A, c) in enumerate(zip(axes[0], test_amps, colors)):
+        ax.plot(t_plot, q_std[:, i], color=c, lw=1.6, label="predicted std")
+        ax.plot(t_plot, residual[:, i], color="black", lw=1.0, ls="--",
+                label="|mean − truth|")
+        seen = "train" if A in train_amps else "UNSEEN"
+        ax.set_title(f"A={A} ({seen})")
+        ax.set_xlabel("t")
+        ax.set_yscale("log")
+    axes[0][0].set_ylabel("q error / spread"); axes[0][0].legend(fontsize=7)
+    fig.suptitle(f"Calibration: posterior std vs actual residual  "
+                 f"(σ={cfg.data.obs_noise}, β={beta_kl})")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "calibration.png")
+    fig.savefig(p, dpi=120); log.info("saved plot -> %s", p)
+
+
+if __name__ == "__main__":
+    main()
